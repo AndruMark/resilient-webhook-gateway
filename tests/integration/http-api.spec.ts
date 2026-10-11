@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { FastifyInstance } from 'fastify';
 import { buildServer } from '../../src/infrastructure/http/server.js';
 import { DatabasePoolFactory } from '../../src/infrastructure/persistence/postgres/database-pool.js';
+import { RedisClientFactory } from '../../src/infrastructure/cache/redis-client.js';
 
 describe('HTTP API & RFC 9457 Error Handling Integration Tests', () => {
   let app: FastifyInstance;
@@ -14,6 +15,7 @@ describe('HTTP API & RFC 9457 Error Handling Integration Tests', () => {
   afterAll(async () => {
     await app.close();
     await DatabasePoolFactory.close();
+    await RedisClientFactory.close();
   });
 
   it('GET /health should return 200 OK with health status', async () => {
@@ -33,7 +35,6 @@ describe('HTTP API & RFC 9457 Error Handling Integration Tests', () => {
       url: '/api/v1/events',
       payload: {
         specversion: '0.9', // Invalid CloudEvent version
-        // Missing mandatory attributes: id, source, type, data
       },
     });
 

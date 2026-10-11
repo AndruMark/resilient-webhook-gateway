@@ -44,3 +44,15 @@ export class InvalidSignatureException extends ProblemDetailsException {
     });
   }
 }
+
+export class RateLimitExceededException extends ProblemDetailsException {
+  constructor(retryAfterSec: number) {
+    super({
+      type: 'https://gateway.internal/errors/rate-limit-exceeded',
+      title: 'Too Many Requests',
+      status: 429,
+      detail: `Rate limit threshold exceeded. Please retry after ${retryAfterSec} seconds.`,
+      retryAfterSec,
+    });
+  }
+}

@@ -68,6 +68,7 @@ describe('DispatchWebhookEventUseCase', () => {
       updateStatus: vi.fn().mockResolvedValue(undefined),
     };
     mockSubscriptionRepo = {
+      save: vi.fn().mockResolvedValue(undefined),
       findById: vi.fn().mockResolvedValue(testSubscription),
       findActiveByEventType: vi.fn(),
     };
@@ -125,6 +126,7 @@ describe('DispatchWebhookEventUseCase', () => {
       updateStatus: vi.fn().mockResolvedValue(undefined),
     };
     mockSubscriptionRepo = {
+      save: vi.fn().mockResolvedValue(undefined),
       findById: vi.fn().mockResolvedValue(testSubscription),
       findActiveByEventType: vi.fn(),
     };

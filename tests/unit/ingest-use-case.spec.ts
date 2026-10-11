@@ -28,6 +28,7 @@ describe('IngestWebhookEventUseCase', () => {
 
   beforeEach(() => {
     mockSubscriptionRepo = {
+      save: vi.fn().mockResolvedValue(undefined),
       findById: vi.fn(),
       findActiveByEventType: vi.fn().mockResolvedValue([sampleSubscription]),
     };

@@ -7,6 +7,7 @@ import { FetchWebhookDispatcher } from './infrastructure/http/fetch-webhook-disp
 import { NodeCryptoSignatureVerifier } from './infrastructure/crypto/node-crypto-signature-verifier.js';
 import { DispatchWebhookEventUseCase } from './application/use-cases/dispatch-webhook-event.use-case.js';
 import { OutboxDispatcherWorker } from './infrastructure/workers/outbox-dispatcher.worker.js';
+import { RedisClientFactory } from './infrastructure/cache/redis-client.js';
 
 const port = Number(process.env['PORT'] ?? 3000);
 const host = process.env['HOST'] ?? '0.0.0.0';
@@ -53,6 +54,7 @@ for (const signal of signals) {
       await worker.stop();
       await server.close();
       await DatabasePoolFactory.close();
+      await RedisClientFactory.close();
       console.log('✅ Services cleanly terminated.');
       process.exit(0);
     })();

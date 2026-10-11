@@ -1,0 +1,72 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate-and-test:
+    name: Build, Typecheck & Test Suite
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_DB: webhook_gateway
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install pnpm Package Manager
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.12.0
+          run_install: false
+
+      - name: Setup Node.js Runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck TypeScript Sources
+        run: pnpm typecheck
+
+      - name: Run Database Schema Migrations
+        env:
+          DATABASE_URL: postgresql://postgres:postgrespassword@127.0.0.1:5433/webhook_gateway
+          REDIS_URL: redis://127.0.0.1:6379
+        run: pnpm db:migrate
+
+      - name: Execute Vitest Test Suites
+        env:
+          DATABASE_URL: postgresql://postgres:postgrespassword@127.0.0.1:5433/webhook_gateway
+          REDIS_URL: redis://127.0.0.1:6379
+          NODE_ENV: test
+        run: pnpm test

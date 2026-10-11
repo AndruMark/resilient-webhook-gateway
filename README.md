@@ -1,8 +1,10 @@
 # Resilient Webhook Gateway
 
+[![CI Pipeline](https://github.com/AndruMark/resilient-webhook-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/AndruMark/resilient-webhook-gateway/actions/workflows/ci.yml)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg?logo=typescript)](https://www.typescriptlang.org/)
 [![Fastify](https://img.shields.io/badge/Fastify-5.x-black.svg?logo=fastify)](https://www.fastify.io/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791.svg?logo=postgresql)](https://www.postgresql.org/)
+[![Redis](https://img.shields.io/badge/Redis-7-DC382D.svg?logo=redis)](https://redis.io/)
 [![CNCF CloudEvents](https://img.shields.io/badge/CNCF-CloudEvents_v1.0.2-blueviolet.svg)](https://cloudevents.io/)
 [![RFC 9457](https://img.shields.io/badge/RFC-9457_Problem_Details-informational.svg)](https://datatracker.ietf.org/doc/html/rfc9457)
 [![RFC 2104](https://img.shields.io/badge/RFC-2104_HMAC--SHA256-brightgreen.svg)](https://datatracker.ietf.org/doc/html/rfc2104)
@@ -10,7 +12,7 @@
 
 An enterprise-grade, high-throughput **Webhook Ingestion and Asynchronous Dispatch Gateway** designed under **Hexagonal Architecture (Ports and Adapters)** and Domain-Driven Design (DDD) principles.
 
-This gateway addresses the dual-write problem, transient downstream failures, network partitions, and timing attack vulnerabilities common in distributed event-driven systems.
+This gateway addresses the dual-write problem, transient downstream failures, network partitions, distributed rate limiting, and timing attack vulnerabilities common in distributed event-driven systems.
 
 ---
 
@@ -20,6 +22,7 @@ This gateway addresses the dual-write problem, transient downstream failures, ne
 - [System Design & C4 Diagrams](#system-design--c4-diagrams)
 - [Core Engineering Patterns & Protocols](#core-engineering-patterns--protocols)
   - [Transactional Outbox Pattern with Partial Indexing](#transactional-outbox-pattern-with-partial-indexing)
+  - [Distributed Sliding Window Rate Limiting (Redis)](#distributed-sliding-window-rate-limiting-redis)
   - [CNCF CloudEvents v1.0.2 Compliance](#cncf-cloudevents-v102-compliance)
   - [RFC 9457 Standardized Error Handling](#rfc-9457-standardized-error-handling)
   - [Cryptographic Security (RFC 2104 HMAC-SHA256)](#cryptographic-security-rfc-2104-hmac-sha256)
@@ -43,7 +46,7 @@ The gateway is decoupled into three strict concentric layers adhering to Hexagon
 
 1. **Domain Layer (Core):** Pure business logic with zero framework or infrastructure dependencies. Contains the `WebhookEvent` aggregate root, `CloudEvent` value object, `Subscription` entity, `DeliveryAttempt` audit model, and the exponential backoff calculation engine.
 2. **Application Layer:** Orchestrates business interactions via use cases (`IngestWebhookEventUseCase`, `DispatchWebhookEventUseCase`) using input/output DTOs and abstract Port interfaces.
-3. **Infrastructure Layer:** Implements external adapters: Fastify HTTP server, RFC 9457 problem details middleware, PostgreSQL relational persistence, native `fetch` dispatchers with `AbortSignal` timeouts, and Node.js `crypto` constant-time verifiers.
+3. **Infrastructure Layer:** Implements external adapters: Fastify HTTP server, RFC 9457 problem details middleware, Redis sliding window rate limiter, PostgreSQL relational persistence, native `fetch` dispatchers with `AbortSignal` timeouts, and Node.js `crypto` constant-time verifiers.
 
 ---
 
@@ -65,22 +68,27 @@ flowchart TD
         OutboxWorker["OutboxDispatcherWorker\n(Background Polling Loop)"]
         DispatchUC["DispatchWebhookEventUseCase"]
         Crypto["HMAC-SHA256 Verifier\n(RFC 2104 & Constant-Time)"]
+        Dispatcher["FetchWebhookDispatcher\n(HTTP Client with Timeout)"]
     end
 
-    subgraph Persistence
+    subgraph Data Tier
         PG[("PostgreSQL 16\nTransactional Outbox")]
+        Redis[("Redis 7\nSliding Window Cache")]
     end
 
     Publisher -->|POST CloudEvent v1.0.2| HTTP
+    HTTP -->|Rate Limiting Check| Redis
     HTTP --> IngestUC
     IngestUC -->|Atomic INSERT status=PENDING| PG
     HTTP -.->|202 Accepted| Publisher
 
-    OutboxWorker -->|SELECT ... WHERE status IN ('PENDING','FAILED')| PG
+    OutboxWorker -->|Poll status PENDING or FAILED| PG
     OutboxWorker --> DispatchUC
     DispatchUC --> Crypto
-    DispatchUC -->|POST Signed Webhook| Consumer
-    Consumer -.->|200 OK or 5xx Error| DispatchUC
+    DispatchUC -->|POST Signed Webhook| Dispatcher
+    Dispatcher -->|Dispatch Event| Consumer
+    Consumer -.->|200 OK or 5xx Error| Dispatcher
+    Dispatcher -.->|Response or Timeout| DispatchUC
     DispatchUC -->|UPDATE status, next_retry_at, attempts| PG
 ```
 
@@ -116,6 +124,14 @@ WHERE status IN ('PENDING', 'FAILED');
 
 This ensures the polling worker scans exclusively active or retryable events without table scans or bloated B-tree index traversal over historical `DELIVERED` records.
 
+### Distributed Sliding Window Rate Limiting (Redis)
+
+To protect the ingestion boundary from Denial of Service (DoS) attacks and downstream saturation, the gateway enforces a distributed **Sliding Window Log** rate limiter backed by Redis Sorted Sets (`ZSET`):
+
+1. **Atomic Execution:** Pipelines purge expired request timestamps (`ZREMRANGEBYSCORE`) and evaluate cardinality (`ZCARD`) within the rolling window.
+2. **IETF RateLimit Headers:** Emits standard `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` headers on every response.
+3. **Fail-Open Resilience:** If Redis experiences network partition or transient outage, the gateway gracefully fails open to preserve API ingestion availability while logging a system warning.
+
 ### CNCF CloudEvents v1.0.2 Compliance
 
 Incoming payloads must satisfy the CloudEvents v1.0.2 standard JSON structured format. Mandatory attributes (`specversion`, `id`, `source`, `type`, `data`) and RFC 3339 timestamps are strictly validated inside the `CloudEvent` domain value object before acceptance.
@@ -128,7 +144,7 @@ Example payload emitted upon schema validation failure:
 
 ```json
 {
-  "type": "https://gateway.internal/errors/invalid-cloud-event",
+  "type": "[https://gateway.internal/errors/invalid-cloud-event](https://gateway.internal/errors/invalid-cloud-event)",
   "title": "Invalid CloudEvent Specification",
   "status": 400,
   "detail": "CloudEvent validation failed against specification rules.",
@@ -174,7 +190,7 @@ Where:
 
 The worker executes dispatches in discrete batches bounded by `Promise.allSettled`. 
 
-Upon receiving termination signals (`SIGINT`, `SIGTERM`), the engine drains in-flight HTTP requests, closes server sockets, flushes the database connection pool, and exits with code `0` to prevent orphaned socket connections or unhandled reconnections during cluster rolling updates.
+Upon receiving termination signals (`SIGINT`, `SIGTERM`), the engine drains in-flight HTTP requests, closes server sockets, flushes the database and cache connection pools, and exits with code `0` to prevent orphaned socket connections or unhandled reconnections during cluster rolling updates.
 
 ---
 
@@ -203,6 +219,8 @@ Upon receiving termination signals (`SIGINT`, `SIGTERM`), the engine drains in-f
 ## Project Layout
 
 ```text
+├── .github/
+│   └── workflows/ci.yml            # Automated CI Pipeline (Typecheck, DB Migration, Tests)
 ├── scripts/
 │   └── e2e-demo.ts                 # Full end-to-end integration simulation
 ├── src/
@@ -214,6 +232,7 @@ Upon receiving termination signals (`SIGINT`, `SIGTERM`), the engine drains in-f
 │   │   ├── use-cases/              # Ingest & Dispatch Use Cases
 │   │   └── dto/                    # Command & Result Data Transfer Objects
 │   ├── infrastructure/             # Frameworks, Drivers, and Adapters
+│   │   ├── cache/                  # Redis Client & Sliding Window Rate Limiter
 │   │   ├── crypto/                 # HMAC-SHA256 Timing-Safe Verifier
 │   │   ├── http/                   # Fastify Server, Controllers, Routes
 │   │   ├── persistence/postgres/   # Relational Repositories & SQL Schema
@@ -221,7 +240,7 @@ Upon receiving termination signals (`SIGINT`, `SIGTERM`), the engine drains in-f
 │   └── index.ts                    # Composition Root & Entry Point
 ├── tests/
 │   ├── unit/                       # Isolated Domain and Worker Unit Tests
-│   └── integration/                # Fastify HTTP & RFC 9457 Inject Tests
+│   └── integration/                # Fastify HTTP, Rate Limiting & RFC 9457 Inject Tests
 ├── docker-compose.yml              # PostgreSQL 16 & Redis 7 Infrastructure
 ├── start-env.ps1                   # Environment startup automation
 ├── stop-env.ps1                    # Environment cleanup & RAM reclamation
@@ -242,7 +261,7 @@ Upon receiving termination signals (`SIGINT`, `SIGTERM`), the engine drains in-f
 
 1. Clone repository and install dependencies:
    ```bash
-   git clone https://github.com/<your-user>/resilient-webhook-gateway.git
+   git clone [https://github.com/AndruMark/resilient-webhook-gateway.git](https://github.com/AndruMark/resilient-webhook-gateway.git)
    cd resilient-webhook-gateway
    pnpm install
    ```
@@ -258,6 +277,7 @@ Upon receiving termination signals (`SIGINT`, `SIGTERM`), the engine drains in-f
    HOST=0.0.0.0
    DATABASE_URL=postgresql://postgres:postgrespassword@127.0.0.1:5433/webhook_gateway
    REDIS_URL=redis://127.0.0.1:6379
+   RATE_LIMIT_MAX=100
    HMAC_SECRET_KEY=dev_secret_key_change_in_production_min_32_chars
    ```
 
@@ -287,7 +307,7 @@ The gateway listens on `http://127.0.0.1:3000` while the background outbox worke
 
 ## Testing & Quality Assurance
 
-The test suite runs using [Vitest](https://vitest.dev/) with strict coverage of domain invariants, timing resistance, and HTTP error compliance:
+The test suite runs using [Vitest](https://vitest.dev/) with strict coverage of domain invariants, timing resistance, rate limiting, and HTTP error compliance:
 
 ```bash
 # Run all unit and integration test suites
